@@ -9,28 +9,33 @@
 ```mermaid
 graph TD
     A["区块链节点"] -->|"eth_blockNumber"| B["区块监控器<br/>[生产者]"]
-    B -->|"获取区块数据"| A
+    B -->|"eth_getBlockByNumber"| A
 
     B -->|"blockNumber"| K1["Kafka Topic:<br/>NewBlockNumbers"]
     B -->|"txID[]"| K2["Kafka Topic:<br/>TransactionIDs"]
 
-    K1 --> C1["区块处理器<br/>[消费者]"]
+    K1 --> C1["Gas Fee 处理器<br/>[消费者]"]
     K2 --> C2["交易处理器<br/>[消费者]"]
 
-    C1 -->|"eth_getBlockByNumber"| A
+    C1 -->|"eth_getBlockByNumber<br/>获取baseFeePerGas,<br/>gasLimit等"| A
     C2 -->|"eth_getTransactionByHash"| A
 
-    C1 --> D["PostgreSQL<br/>区块数据"]
-    C2 --> D["PostgreSQL<br/>交易数据"]
+    C1 --> D1["PostgreSQL<br/>Gas 统计数据<br/>(baseFeePerGas,<br/>gasLimit等)"]
+    C2 --> D2["PostgreSQL<br/>交易数据"]
 
     subgraph "消息队列"
-    K1
-    K2
+    K1["NewBlockNumbers<br/>(区块号)"]
+    K2["TransactionIDs<br/>(交易哈希)"]
     end
 
     subgraph "消费者处理"
     C1
     C2
+    end
+
+    subgraph "数据存储"
+    D1
+    D2
     end
 ```
 
@@ -40,120 +45,99 @@ graph TD
 
     - 核心职责：
         - 监控最新区块号（eth_blockNumber）
-        - 获取区块数据（eth_getBlockByNumber）
+        - 获取完整区块数据（eth_getBlockByNumber）
         - 提取区块中的所有交易 ID
-        - 确保区块号连续性
-        - 处理链重组情况
     - 数据分发：
         - 将区块号推送到 NewBlockNumbers 队列
         - 将交易 ID 列表推送到 TransactionIDs 队列
-    - 保证数据完整性：
-        - 确保每个区块的所有交易 ID 都被提取
-        - 确保区块号的连续性
-        - 发生重组时重新处理受影响区块
 
 2. **消息队列**
 
     - NewBlockNumbers Topic：
         - 消息格式：区块号（整数）
-        - 用途：保证区块处理顺序
+        - 用途：Gas Fee 数据分析
     - TransactionIDs Topic：
-        - 消息格式：{blockNumber, txID, index}
-        - 用途：交易处理队列
-        - 保证交易处理顺序
+        - 消息格式：交易哈希字符串
+        - 用途：交易详情获取
 
 3. **消费者**
-    - 区块处理器：
-        - 消费区块号
-        - 处理区块基本信息
-        - 更新区块状态
+    - Gas Fee 处理器：
+        - 从 NewBlockNumbers 队列获取区块号
+        - 调用 eth_getBlockByNumber 获取区块 Gas 信息：
+            - baseFeePerGas
+            - gasLimit
+            - gasUsed
+        - 计算并存储 Gas 统计数据
     - 交易处理器：
-        - 消费交易 ID
-        - 获取详细交易数据
-        - 处理交易信息
+        - 从 TransactionIDs 队列获取交易哈希
+        - 调用 eth_getTransactionByHash 获取交易详情
+        - 存储交易数据
 
 ### 关键流程
 
-1. **生产者处理流程**
+1. **Gas Fee 处理流程**
 
 ```go
-type BlockProducer struct {
-    lastProcessedBlock uint64
-    eth               *ethclient.Client
-    kafka             *kafka.Producer
+type GasFeeProcessor struct {
+    eth    *ethclient.Client
+    db     *sql.DB
 }
 
-func (p *BlockProducer) Start() {
-    for {
-        // 获取最新区块号
-        latestBlock, err := p.eth.BlockNumber(context.Background())
+func (p *GasFeeProcessor) ProcessGasFee() {
+    for blockNum := range kafka.Consume("NewBlockNumbers") {
+        // 获取区块 Gas 信息
+        block, err := p.eth.BlockByNumber(context.Background(), big.NewInt(int64(blockNum)))
         if err != nil {
-            time.Sleep(retryInterval)
             continue
         }
 
-        // 处理从上次处理的区块到最新区块
-        for blockNum := p.lastProcessedBlock + 1; blockNum <= latestBlock; blockNum++ {
-            // 获取区块数据
-            block, err := p.eth.BlockByNumber(context.Background(), big.NewInt(int64(blockNum)))
-            if err != nil {
-                continue
-            }
-
-            // 检查区块连续性
-            if block.ParentHash() != p.lastBlockHash {
-                // 处理链重组
-                p.handleReorg(blockNum)
-                continue
-            }
-
-            // 发送区块号到队列
-            p.kafka.Produce("NewBlockNumbers", blockNum)
-
-            // 提取并发送所有交易ID
-            for txIndex, tx := range block.Transactions() {
-                txInfo := TxInfo{
-                    BlockNumber: blockNum,
-                    TxID:       tx.Hash().Hex(),
-                    Index:      uint64(txIndex),
-                }
-                p.kafka.Produce("TransactionIDs", txInfo)
-            }
-
-            p.lastProcessedBlock = blockNum
-            p.lastBlockHash = block.Hash()
+        // 提取 Gas 相关数据
+        gasInfo := &GasInfo{
+            BlockNumber:    blockNum,
+            BaseFeePerGas: block.BaseFee(),
+            GasLimit:      block.GasLimit(),
+            GasUsed:       block.GasUsed(),
+            BlockTime:     block.Time(),
         }
 
-        time.Sleep(pollingInterval)
+        // 存储 Gas 信息
+        p.saveGasInfo(gasInfo)
     }
+}
+
+type GasInfo struct {
+    BlockNumber    uint64
+    BaseFeePerGas *big.Int
+    GasLimit      uint64
+    GasUsed       uint64
+    BlockTime     uint64
 }
 ```
 
-2. **消费者处理流程**
+2. **交易处理流程**
 
 ```go
-// 交易处理器
 type TxProcessor struct {
     eth    *ethclient.Client
     db     *sql.DB
 }
 
 func (p *TxProcessor) ProcessTransactions() {
-    for txInfo := range kafka.Consume("TransactionIDs") {
+    for txHash := range kafka.Consume("TransactionIDs") {
         // 获取交易详情
-        tx, _, err := p.eth.TransactionByHash(context.Background(), common.HexToHash(txInfo.TxID))
+        tx, _, err := p.eth.TransactionByHash(context.Background(), common.HexToHash(txHash))
         if err != nil {
             continue
         }
 
-        // 处理交易数据
+        // 获取交易收据
         receipt, err := p.eth.TransactionReceipt(context.Background(), tx.Hash())
         if err != nil {
             continue
         }
 
         // 存储交易数据
-        p.saveTransaction(tx, receipt, txInfo.BlockNumber, txInfo.Index)
+        p.saveTxInfo(tx, receipt)
     }
 }
 ```
@@ -165,7 +149,6 @@ producer:
     polling_interval: 1s # 区块监控间隔
     retry_interval: 5s # 错误重试间隔
     max_retries: 3 # 最大重试次数
-    reorg_threshold: 100 # 链重组检测阈值
 
 kafka:
     topics:
@@ -179,7 +162,7 @@ kafka:
             retention: 24h # 消息保留时间
 
 consumer:
-    block_processor:
+    gas_processor:
         batch_size: 100 # 批量处理大小
         concurrent: 1 # 保证顺序处理
     tx_processor:
@@ -191,7 +174,7 @@ consumer:
 
 -   实时区块数据同步
 -   交易数据索引
--   智能合约事件监听
+-   Gas Fee 统计分析
 -   高性能数据查询接口
 -   可配置的数据过滤器
 -   支持多链索引
