@@ -23,14 +23,6 @@ graph TD
     C1 --> D["PostgreSQL<br/>区块数据"]
     C2 --> D["PostgreSQL<br/>交易数据"]
 
-    subgraph "生产者职责"
-    B1[" - 监控最新区块号"]
-    B2[" - 获取区块数据"]
-    B3[" - 提取所有交易ID"]
-    B4[" - 保证区块连续性"]
-    B5[" - 处理链重组"]
-    end
-
     subgraph "消息队列"
     K1
     K2
